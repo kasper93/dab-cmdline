@@ -117,44 +117,42 @@ int32_t	i;
 	      X[i] -= min;
       }
 }
+
+template<typename T>
+static inline T* alloc_array(std::size_t align, std::size_t count) {
+	T *ptr;
+#if defined(__MINGW32__) || defined(_MSC_VER)
+	ptr = static_cast<T*>(_aligned_malloc(count * sizeof(T), align));
+#else
+	if (posix_memalign((void**)&ptr, align, count * sizeof(T)))
+		ptr = nullptr;
+#endif
+	if (ptr == nullptr)
+		throw std::bad_alloc();
+	return ptr;
+}
+
+template<typename T>
+static inline void free_array(T *ptr) {
+#if defined(__MINGW32__) || defined(_MSC_VER)
+	_aligned_free(ptr);
+#else
+	free(ptr);
+#endif
+}
+
 //
 	viterbiSpiral::viterbiSpiral (int16_t wordlength) {
 int polys [RATE] = POLYS;
 int16_t	i, state;
-#if defined(__MINGW32__) || defined(_MSC_VER)
-uint32_t	size;
-#endif
+size_t size = wordlength + (K - 1);
 
 	frameBits		= wordlength;
 //	partab_init	();
 
-// B I G N O T E	The spiral code uses (wordLength + (K - 1) * sizeof ...
-// However, the application then crashes, so something is not OK
-// By doubling the size, the problem disappears. It is not solved though
-// and not further investigation.
-#if defined(__MINGW32__) || defined(_MSC_VER)
-	size = 2 * ((wordlength + (K - 1)) / 8 + 1 + 16) & ~0xF;
-	data	= (uint8_t *)_aligned_malloc (size, 16);
-	size = 2 * (RATE * (wordlength + (K - 1)) * sizeof(COMPUTETYPE) + 16) & ~0xF;
-	symbols	= (COMPUTETYPE *)_aligned_malloc (size, 16);
-	size	= 2 * (wordlength + (K - 1)) * sizeof (decision_t);	
-	size	= (size + 16) & ~0xF;
-	vp. decisions = (decision_t  *)_aligned_malloc (size, 16);
-#else
-	if (posix_memalign ((void**)&data, 16,
-	                        (wordlength + (K - 1))/ 8 + 1)){
-	   printf ("Allocation of data array failed\n");
-	}
-	if (posix_memalign ((void**)&symbols, 16,
-	                     RATE * (wordlength + (K - 1)) * sizeof(COMPUTETYPE))){
-	   printf ("Allocation of symbols array failed\n");
-	}
-	if (posix_memalign ((void**)&(vp. decisions),
-	                    16,
-	                    2 * (wordlength + (K - 1)) * sizeof (decision_t))){
-	   printf ("Allocation of vp decisions failed\n");
-	}
-#endif
+	data = alloc_array<std::remove_reference<decltype(*data)>::type>(ALIGN, size / 8 + 1);
+	symbols = alloc_array<std::remove_reference<decltype(*symbols)>::type>(ALIGN, RATE * size);
+	vp.decisions = alloc_array<std::remove_reference<decltype(*vp.decisions)>::type>(ALIGN, size);
 
 	for (state = 0; state < NUMSTATES / 2; state++) {
 	   for (i = 0; i < RATE; i++)
@@ -168,15 +166,9 @@ uint32_t	size;
 
 
 	viterbiSpiral::~viterbiSpiral	(void) {
-#if defined(__MINGW32__) || defined(_MSC_VER)
-	_aligned_free (vp. decisions);
-	_aligned_free (data);
-	_aligned_free (symbols);
-#else
-	free (vp. decisions);
-	free (data);
-	free (symbols);
-#endif
+		free_array(vp.decisions);
+		free_array(data);
+		free_array(symbols);
 }
 
 static int maskTable [] = {128, 64, 32, 16, 8, 4, 2, 1};
@@ -237,7 +229,7 @@ uint32_t	i;
 
 /* C-language butterfly */
 void	viterbiSpiral::BFLY (int i, int s, COMPUTETYPE * syms,
-	                   struct v * vp, decision_t * d) {
+	                   struct v * vp, decision_t d) {
 int32_t j, decision0, decision1;
 COMPUTETYPE metric,m0,m1,m2,m3;
 
@@ -248,20 +240,20 @@ COMPUTETYPE metric,m0,m1,m2,m3;
 	metric = metric >> PRECISIONSHIFT;
 	const COMPUTETYPE max =
 	        ((RATE * ((256 - 1) >> METRICSHIFT)) >> PRECISIONSHIFT);
-	  
-	m0 = vp->old_metrics->t [i] + metric;
-	m1 = vp->old_metrics->t [i + NUMSTATES / 2] + (max - metric);
-	m2 = vp->old_metrics->t [i] + (max - metric);
-	m3 = vp->old_metrics->t [i + NUMSTATES / 2] + metric;
-	  
+
+	m0 = vp->old_metrics[i] + metric;
+	m1 = vp->old_metrics[i + NUMSTATES / 2] + (max - metric);
+	m2 = vp->old_metrics[i] + (max - metric);
+	m3 = vp->old_metrics[i + NUMSTATES / 2] + metric;
+
 	decision0 = ((int32_t)(m0 - m1)) > 0;
 	decision1 = ((int32_t)(m2 - m3)) > 0;
-	  
-	vp -> new_metrics-> t[2 * i] = decision0 ? m1 : m0;
-	vp -> new_metrics-> t[2 * i + 1] =  decision1 ? m3 : m2;
-	  
-	d -> w[i/(sizeof(uint32_t)*8/2)+s*(sizeof(decision_t)/sizeof(uint32_t))] |= 
-		    (decision0|decision1<<1) << ((2*i)&(sizeof(uint32_t)*8-1));
+
+	vp -> new_metrics[2 * i] = decision0 ? m1 : m0;
+	vp -> new_metrics[2 * i + 1] =  decision1 ? m3 : m2;
+
+	d[(2 * i) / decision_bits_per_elem] |=
+		(decision0 | decision1 << 1) << ((2 * i) & (decision_bits_per_elem - 1));
 }
 
 /* Update decoder with a block of demodulated symbols
@@ -271,22 +263,21 @@ COMPUTETYPE metric,m0,m1,m2,m3;
 void	viterbiSpiral::update_viterbi_blk_GENERIC (struct v *vp,
 					            COMPUTETYPE *syms,
 	                                            int16_t nbits){
-decision_t *d = (decision_t *)vp -> decisions;
 int32_t  s, i;
 
 	for (s = 0; s < nbits; s++)
-	   memset (&d [s], 0, sizeof (decision_t));
+	   memset (vp -> decisions + s, 0, sizeof (decision_t));
 
 	for (s = 0; s < nbits; s++){
-	   void *tmp;
+	   decltype(vp -> old_metrics) tmp;
 	   for (i = 0; i < NUMSTATES / 2; i++)
-	      BFLY (i, s, syms, vp, vp -> decisions);
+	      BFLY (i, s, syms, vp, vp -> decisions[s]);
 
-	   renormalize (vp -> new_metrics -> t, RENORMALIZE_THRESHOLD);
+	   renormalize (vp -> new_metrics, RENORMALIZE_THRESHOLD);
 //     Swap pointers to old and new metrics
 	   tmp = vp -> old_metrics;
 	   vp -> old_metrics = vp -> new_metrics;
-	   vp -> new_metrics = (metric_t *)tmp;
+	   vp -> new_metrics = tmp;
 	}
 }
 
@@ -301,18 +292,17 @@ void FULL_SPIRAL_no_sse (int,
 	                 COMPUTETYPE *Y,
 	                 COMPUTETYPE *X,
 	                 COMPUTETYPE *syms,
-	                 DECISIONTYPE *dec,
+	                 uint32_t *dec,
 	                 COMPUTETYPE *Branchtab);
 }
 
 void	viterbiSpiral::update_viterbi_blk_SPIRAL (struct v *vp,
 					           COMPUTETYPE *syms,
 					           int16_t nbits){
-decision_t *d = (decision_t *)vp -> decisions;
 int32_t s;
 
 	for (s = 0; s < nbits; s++)
-	   memset (d + s, 0, sizeof(decision_t));
+	   memset (vp -> decisions + s, 0, sizeof(decision_t));
 
 #if defined(SSE_AVAILABLE)
 	FULL_SPIRAL_sse (nbits / 2,
@@ -321,10 +311,10 @@ int32_t s;
 #else
 	FULL_SPIRAL_no_sse (nbits / 2,
 #endif
-	                 vp -> new_metrics -> t,
-	                 vp -> old_metrics -> t,
+	                 vp -> new_metrics,
+	                 vp -> old_metrics,
 	                 syms,
-	                 d -> t, Branchtab);
+	                 (uint32_t*)vp -> decisions, Branchtab);
 }
 
 //
@@ -333,8 +323,6 @@ void	viterbiSpiral::chainback_viterbi (struct v *vp,
 	                            uint8_t *data, /* Decoded output data */
 	                            int16_t nbits, /* Number of data bits */
 	                            uint16_t endstate){ /*Terminal encoder state */
-decision_t *d = vp -> decisions;
-
 /* Make room beyond the end of the encoder register so we can
  * accumulate a full byte of decoded data
  */
@@ -343,13 +331,12 @@ decision_t *d = vp -> decisions;
  * But this avoids a conditional branch, and the writes will
  * combine in the cache anyway
  */
-	d += (K - 1); /* Look past tail */
 	while (nbits-- != 0){
 	   int k;
 //	   int l	= (endstate >> ADDSHIFT) / 32;
 //	   int m	= (endstate >> ADDSHIFT) % 32;
-	   k = (d [nbits].w [(endstate >> ADDSHIFT) / 32] >>
-	                       ((endstate>>ADDSHIFT) % 32)) & 1;
+	   k = (vp -> decisions [(K - 1) + nbits] [(endstate >> ADDSHIFT) / decision_bits_per_elem] >>
+	                       ((endstate>>ADDSHIFT) % decision_bits_per_elem)) & 1;
 	   endstate = (endstate >> 1) | (k << (K - 2 + ADDSHIFT));
 	   data [nbits >> 3] = endstate >> SUBSHIFT;
 	}
@@ -361,11 +348,11 @@ struct v *vp = p;
 int32_t i;
 
 	for (i = 0; i < NUMSTATES; i++)
-	   vp -> metrics1.t[i] = 63;
+	   vp -> metrics1[i] = 63;
 
-	vp -> old_metrics = &vp -> metrics1;
-	vp -> new_metrics = &vp -> metrics2;
+	vp -> old_metrics = vp -> metrics1;
+	vp -> new_metrics = vp -> metrics2;
 /* Bias known start state */
-	vp -> old_metrics-> t[starting_state & (NUMSTATES-1)] = 0;
+	vp -> old_metrics[starting_state & (NUMSTATES-1)] = 0;
 }
 
